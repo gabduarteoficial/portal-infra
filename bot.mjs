@@ -98,13 +98,16 @@ async function rodarAgora(chatId) {
   } catch { /* is-active retorna != 0 quando inativo; segue */ }
 
   try {
+    // Marca "forçar" pra rodada.sh pular a checagem de dia (seg/qui/dom).
+    // Não precisa de sudo — o bot já roda como o mesmo usuário que a rodada.
+    await execAsync('touch /opt/portal-producao/.forcar-rodada');
     await execAsync('sudo -n /usr/bin/systemctl start portal-rodada.service');
     return responder(
       chatId,
       `🚀 <b>Rodada disparada</b> — ${agora()}\n\n` +
-      `O radar vai coletar as últimas 24h (teto de 100 pesquisas) e o analista entra em seguida.\n` +
-      `Você recebe o log do radar e depois as 100 + as 10.\n\n` +
-      `<i>Costuma levar de 10 a 40 minutos.</i>`
+      `O radar vai coletar (janela dinâmica, teto de 100 pesquisas) e o seletor entra em seguida.\n` +
+      `Você recebe o log do radar e depois os 100 links + os 10 escolhidos.\n\n` +
+      `<i>Disparo manual sempre roda, mesmo fora do dia de agenda (seg/qui/dom). Costuma levar de 5 a 20 minutos.</i>`
     );
   } catch (e) {
     return responder(chatId, `❌ Não consegui disparar: <code>${e.message}</code>`);
@@ -165,38 +168,42 @@ async function status(chatId) {
 
 async function reenviarTop10(chatId) {
   const { rows } = await db.query(`select * from v_top10_hoje`);
-  if (!rows.length) return responder(chatId, 'Nenhum Top 10 nas últimas 24h.');
-  return responder(chatId, '<b>TOP 10 DO DIA</b>\n\n' + rows.map((r) =>
+  if (!rows.length) return responder(chatId, 'Nenhum Top 10 registrado ainda.');
+  return responder(chatId, '<b>ÚLTIMO TOP 10</b>\n\n' + rows.map((r) =>
     `<b>#${r.posicao_ranking} — ${r.nota}/100</b>\n${r.evento} — ${r.cidade}/${r.uf} (C${r.camada_geo})\n` +
-    `${r.produtora || 'produtora não identificada'} · ${r.porte_produtor}\n${r.justificativa}\n${r.url_fonte}`
+    `${r.justificativa}\n👉 ${r.url_fonte}`
   ).join('\n\n'));
 }
 
 async function reenviarCem(chatId) {
+  // v2: roda 3x/semana, não fixa em "últimas 24h" — pega a ÚLTIMA rodada
+  // de análise que existir (janela de 2h cobre a duração de uma rodada).
   const { rows } = await db.query(
-    `select a.nota, n.evento, n.cidade, n.uf, n.camada_geo, n.porte_publico, n.tipo_evento, n.veiculo
+    `select a.nota, n.evento, n.cidade, n.uf, n.camada_geo, n.tipo_evento, n.veiculo
        from analises a join noticias n on n.id = a.noticia_id
-      where a.analisado_em >= now() - interval '24 hours'
+      where a.analisado_em >= (select max(analisado_em) from analises) - interval '2 hours'
       order by a.nota desc`
   );
-  if (!rows.length) return responder(chatId, 'Nenhuma análise nas últimas 24h.');
+  if (!rows.length) return responder(chatId, 'Nenhuma análise registrada ainda.');
   return responder(chatId,
-    `<b>TODAS AS ${rows.length} DO DIA</b>\n<pre>` +
+    `<b>TODOS OS ${rows.length} DA ÚLTIMA RODADA</b>\n<pre>` +
     rows.map((r, i) =>
       `${String(i + 1).padStart(3)} ${String(r.nota).padStart(3)} ${(r.evento || '?').slice(0, 26).padEnd(26)} ${(r.cidade || '?').slice(0, 14).padEnd(14)} C${r.camada_geo} ${(r.tipo_evento || '').slice(0, 12)}`
     ).join('\n') + '</pre>');
 }
 
 const ajuda = (chatId) => responder(chatId,
-  `<b>PORTAL PRODUÇÃO — comandos</b>\n\n` +
-  `<code>@claude now</code>  🚀 dispara a rodada AGORA\n` +
+  `<b>PORTAL PRODUÇÃO — comandos</b> (Agente 2 — só link)\n\n` +
+  `Agenda automática: <b>segunda, quinta e domingo</b> às 00:00 BRT.\n` +
+  `Se segunda cair em feriado nacional, pula pra terça.\n\n` +
+  `<code>@claude now</code>  🚀 dispara a rodada AGORA (fura a agenda)\n` +
   `<code>@claude funk +40 mega -30</code>  temperatura (-100 a +100)\n` +
   `<code>@claude temperatura</code>  perfil ativo\n` +
   `<code>@claude reset</code>  zera tudo\n` +
   `<code>@claude perfil salvar casa</code> / <code>perfil usar casa</code> / <code>perfis</code>\n` +
   `<code>@claude status</code>  última rodada\n` +
-  `<code>@claude top10</code> / <code>@claude 100</code>  reenvia a análise\n\n` +
-  `<i>Travas do escopo (gospel, agenda cultural, janela de 24h, teto de 100, corte 45) não aceitam ajuste.</i>`);
+  `<code>@claude top10</code> / <code>@claude 100</code>  reenvia a última seleção de links\n\n` +
+  `<i>Esse agente só entrega LINKS — sem ler a matéria inteira. Você abre e lê. Travas do escopo (gospel, teto de 100 buscas, corte 45) não aceitam ajuste.</i>`);
 
 // ---------------------------------------------------------------- roteador
 

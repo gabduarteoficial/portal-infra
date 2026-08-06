@@ -171,6 +171,7 @@ cp "$SRC_DIR/schema.sql"                    "$APP_DIR/schema.sql"
 cp "$SRC_DIR/lib/db.mjs"                    "$APP_DIR/lib/db.mjs"
 cp "$SRC_DIR/agentes/radar-eventos.mjs"     "$APP_DIR/agentes/radar-eventos.mjs"
 cp "$SRC_DIR/agentes/analista-materias.mjs" "$APP_DIR/agentes/analista-materias.mjs"
+cp "$SRC_DIR/agentes/deve-rodar-hoje.mjs"   "$APP_DIR/agentes/deve-rodar-hoje.mjs"
 
 cat > "$APP_DIR/package.json" <<'JSON'
 {
@@ -230,16 +231,32 @@ ok "$TABELAS tabelas no schema public"
 log "9/11  Script da rodada"
 cat > "$APP_DIR/rodada.sh" <<'SH'
 #!/usr/bin/env bash
-# Cadeia diária: radar coleta → analista lê e ranqueia.
+# Agente 2: roda seg/qui/dom (com desvio de feriado) → radar coleta
+# (só link) → seletor ranqueia. O timer do systemd dispara TODO DIA às
+# 00:00; quem decide se hoje é dia de trabalhar é o deve-rodar-hoje.mjs.
 set -uo pipefail
 cd /opt/portal-producao
 echo "===== rodada $(date -Is) ====="
+
+FORCAR=0
+if [[ -f .forcar-rodada ]]; then
+  FORCAR=1
+  rm -f .forcar-rodada
+  echo "disparo manual (@claude now) — pulando checagem de dia"
+fi
+
+if [[ $FORCAR -eq 0 ]]; then
+  if ! node agentes/deve-rodar-hoje.mjs; then
+    echo "hoje não é dia de agenda (seg/qui/dom, com desvio de feriado). Encerrando sem coletar."
+    exit 0
+  fi
+fi
 
 node agentes/radar-eventos.mjs
 STATUS_RADAR=$?
 
 if [[ $STATUS_RADAR -ne 0 ]]; then
-  echo "radar falhou (exit $STATUS_RADAR) — analista NÃO será executado"
+  echo "radar falhou (exit $STATUS_RADAR) — seletor NÃO será executado"
   exit $STATUS_RADAR
 fi
 
@@ -248,7 +265,7 @@ echo "===== fim $(date -Is) ====="
 SH
 chmod +x "$APP_DIR/rodada.sh"
 chown "$APP_USER:$APP_USER" "$APP_DIR/rodada.sh"
-ok "rodada.sh pronto"
+ok "rodada.sh pronto (agenda seg/qui/dom + desvio de feriado)"
 
 # ---------------------------------------------------------------------
 log "10/11  systemd, sudoers e logrotate"
@@ -277,7 +294,7 @@ UNIT
 
 cat > /etc/systemd/system/portal-rodada.service <<UNIT
 [Unit]
-Description=Portal Producao - rodada diaria (radar + analista)
+Description=Portal Producao - rodada (Agente 2: seg/qui/dom, o script decide o dia)
 After=network-online.target docker.service
 
 [Service]
@@ -293,7 +310,7 @@ UNIT
 
 cat > /etc/systemd/system/portal-rodada.timer <<UNIT
 [Unit]
-Description=Dispara a rodada todo dia as 00:00 (America/Sao_Paulo)
+Description=Dispara todo dia as 00:00 BRT - rodada.sh decide se e dia de trabalhar (seg/qui/dom)
 
 [Timer]
 OnCalendar=*-*-* 00:00:00

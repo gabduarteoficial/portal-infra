@@ -171,6 +171,9 @@ ON CONFLICT (chave) DO NOTHING;
 
 -- ---------------------------------------------------------------------
 -- View de conveniencia: o Top 10 da rodada mais recente
+-- v2: nao roda mais todo dia (seg/qui/dom), entao "ultimas 24h" quebraria
+-- em qualquer dia sem rodada. Em vez disso, pega a ULTIMA rodada de
+-- analise que existir (janela de 2h cobre a duracao de uma rodada).
 -- ---------------------------------------------------------------------
 CREATE OR REPLACE VIEW v_top10_hoje AS
 SELECT a.posicao_ranking, a.nota, n.evento, n.cidade, n.uf, n.camada_geo,
@@ -179,7 +182,7 @@ SELECT a.posicao_ranking, a.nota, n.evento, n.cidade, n.uf, n.camada_geo,
 FROM analises a
 JOIN noticias n ON n.id = a.noticia_id
 WHERE a.no_top10 = true
-  AND a.analisado_em >= now() - interval '24 hours'
+  AND a.analisado_em >= (SELECT max(analisado_em) FROM analises) - interval '2 hours'
 ORDER BY a.posicao_ranking;
 
 -- ---------------------------------------------------------------------

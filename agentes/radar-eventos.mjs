@@ -1,16 +1,25 @@
 /**
- * AGENTE 1 — RADAR-EVENTOS
- * Coleta bruta das últimas 24h. Teto de 100 pesquisas escritas/dia.
- * Não reescreve, não cria pasta, não publica. Grava cru no Supabase.
+ * AGENTE 2 — RADAR-EVENTOS (versão enxuta, só link)
  *
- * Spec: ../../agentes/radar-eventos.md
+ * Diferença pro Agente 1 (congelado na tag agente-v1-analise-completa):
+ *   - NÃO entra nas páginas (sem web_fetch) — só busca e pega
+ *     título + resuminho que já vem pronto na busca. Bem mais barato.
+ *   - Roda 3x/semana (seg/qui/dom, com desvio de feriado — ver
+ *     deve-rodar-hoje.mjs), não todo dia.
+ *   - Janela de coleta é DINÂMICA: cobre o tempo desde a última rodada
+ *     que deu certo, não um "últimas 24h" fixo — assim não perde
+ *     notícia nos dias que ele não roda.
+ *   - Muitos campos (porte, produtora, cachê, versão oficial x público)
+ *     ficam em branco de propósito — isso exige ler a matéria inteira,
+ *     e é exatamente o que a leitura leve não faz. Fica pra você ler
+ *     na hora de abrir o link.
  */
 import Anthropic from '@anthropic-ai/sdk';
 import crypto from 'node:crypto';
 import { db, telegram, lerTemperaturas, aplicarTemp, agora } from '../lib/db.mjs';
 
 const client = new Anthropic();
-const MODEL = 'claude-opus-5';
+const MODEL = 'claude-sonnet-5'; // mais barato que Opus, sobra pra tarefa de busca+classificação
 const TETO = Number(process.env.TETO_PESQUISAS_DIA || 100);
 
 // ---------------------------------------------------------------- frentes
@@ -30,33 +39,37 @@ const FRENTES = [
   { id: 'redes',      camada: 0, orcamento: 6,  alvo: 'Repercussão pública: relatos, vídeos, avaliações, Reclame Aqui, reviews de espaço de evento' },
 ];
 
+// ---------------------------------------------------------------- janela dinâmica
+
+/** Cobre o tempo desde a última rodada que deu certo (+ margem de 2h). Mínimo 24h, teto 7 dias. */
+async function janelaDinamica() {
+  const { rows } = await db.query(
+    `select rodou_em from log_execucao where concluido = true order by rodou_em desc limit 1`
+  );
+  if (!rows.length) return 24;
+  const horas = (Date.now() - new Date(rows[0].rodou_em).getTime()) / 3_600_000;
+  return Math.min(Math.max(Math.ceil(horas) + 2, 24), 168);
+}
+
 // ---------------------------------------------------------------- prompt
 
-const SISTEMA = `Você é o RADAR-EVENTOS, coletor bruto do Portal Produção — portal de nicho sobre BASTIDORES do mercado de eventos brasileiro.
+const SISTEMA = `Você é o RADAR-EVENTOS (versão enxuta) do Portal Produção — portal de nicho sobre BASTIDORES do mercado de eventos brasileiro.
 
-MISSÃO: coletar acontecimentos das ÚLTIMAS 24 HORAS e devolver os dados CRUS. Você NÃO reescreve, NÃO opina, NÃO sugere pauta, NÃO publica.
+MISSÃO: buscar acontecimentos recentes e devolver LINK + TÍTULO + RESUMO CURTO — exatamente o que aparece no resultado da busca. Você NÃO entra na página, NÃO lê a matéria inteira, NÃO inventa dado que não está no título/resumo.
 
-NICHOS (taxonomia fixa — use exatamente estes códigos):
-producao, cancelamento, reembolso, atraso_palco, transito, violencia_assedio, arma_fogo, atraso_pagamento, reclamacao_equipe, rider, avaliacao
+NICHOS (taxonomia fixa): producao, cancelamento, reembolso, atraso_palco, transito, violencia_assedio, arma_fogo, atraso_pagamento, reclamacao_equipe, rider, avaliacao
 
-TEMAS QUE CAEM NOS NICHOS: alvará, AVCB, interdição, embargo, acessibilidade/PCD, fila, catraca, cashless, som alto/multa de ruído, cancelamento por chuva, preço de bar, segurança privada, cachê, contrato, ECAD, meia-entrada, cambista, golpe de ingresso, patrocínio, Lei Rouanet, PROAC, camarim, backstage.
-
-BLOQUEIO DURO — NUNCA colete:
+BLOQUEIO DURO:
 - agenda cultural, "o que fazer no fim de semana", calendário sazonal
-- qualquer matéria com mais de 24 horas
-- release puro de assessoria sem fato novo
-- opinião/coluna/editorial sem fato datado
-- EVENTO GOSPEL (fora do escopo do portal). Se aparecer de carona e o fato central for de produção (palco cedeu, calote, interdição, arma), grave com estilo_musical=["outros"].
+- matéria fora da janela de tempo informada no pedido
+- EVENTO GOSPEL (fora do escopo do portal)
 - fofoca de celebridade sem ligação com produção
 
 REGRAS INVIOLÁVEIS:
-1. texto_bruto = o conteúdo COMO VEIO da fonte. Não reescreva, não resuma, não melhore.
-2. NUNCA invente fonte, URL, citação, número de público ou crédito de foto.
-3. Público estimado só com base (nota oficial > boletim PM/Bombeiros > capacidade licenciada > lotação declarada). Sem base: publico_estimado=null, porte_publico="nao_informado" e registre em lacunas.
-4. NUNCA nomeie pessoa física em caso criminal quando a fonte não a nomeou.
-5. Rede social entra com tipo_fonte="rede_social" — é repercussão, não fato.
-6. Registre a URL das imagens e vídeos. NUNCA baixe. Crédito não declarado = "nao_identificado".
-7. Se não encontrar nada, devolva lista vazia. NÃO invente para preencher.`;
+1. resumo_busca = o texto que APARECEU na busca (título/trecho). Nunca invente, nunca complete com o que você "acha" que a matéria diz.
+2. Campos que exigem ler a matéria inteira (quem produziu, porte de público, se tem versão oficial) você NÃO tem como saber só pelo título — deixe em branco/lacuna, não chute.
+3. NUNCA invente URL, veículo ou data.
+4. Se não achar nada relevante numa frente, devolva lista vazia — não force resultado pra preencher.`;
 
 const SCHEMA = {
   type: 'object',
@@ -67,49 +80,24 @@ const SCHEMA = {
         type: 'object',
         properties: {
           titulo_original: { type: 'string' },
-          texto_bruto: { type: 'string', description: 'Conteúdo cru da fonte, sem reescrita' },
+          resumo_busca: { type: 'string', description: 'O trecho/resumo que já veio no resultado da busca — NÃO é o texto completo da matéria' },
           url_fonte: { type: 'string' },
           veiculo: { type: 'string' },
           tipo_fonte: { type: 'string', enum: ['portal', 'oficial', 'rede_social', 'review', 'dado_publico'] },
-          data_ocorrido: { type: 'string', description: 'yyyy-mm-dd' },
-          data_publicacao_fonte: { type: 'string', description: 'ISO 8601 ou vazio' },
+          data_ocorrido: { type: 'string', description: 'yyyy-mm-dd — deixe vazio se não der pra saber só pelo título/resumo' },
           evento: { type: 'string' },
           cidade: { type: 'string' },
           uf: { type: 'string' },
           ddd: { type: 'string', enum: ['014', '018', 'outro'] },
           camada_geo: { type: 'integer' },
-          local_evento: { type: 'string' },
           artistas: { type: 'array', items: { type: 'string' } },
           estilo_musical: { type: 'array', items: { type: 'string', enum: ['funk','sertanejo','pagode','trap','eletronica','rock','mpb','forro','rap','axe','pop','outros','nao_identificado'] } },
           tipo_evento: { type: 'string', enum: ['universitario','corrida','peao_rodeio','festival','balada','micareta_bloco','show_fechado','feira_expo','corporativo','outros','nao_identificado'] },
-          porte_produtor: { type: 'string', enum: ['pequeno','medio','grande','grande_produtora','nao_identificado'] },
-          produtora: { type: 'string' },
-          ticketeira: { type: 'string' },
           nichos: { type: 'array', items: { type: 'string', enum: ['producao','cancelamento','reembolso','atraso_palco','transito','violencia_assedio','arma_fogo','atraso_pagamento','reclamacao_equipe','rider','avaliacao'] } },
-          porte_publico: { type: 'string', enum: ['micro','pequeno','medio','grande','mega','nao_informado'] },
-          publico_estimado: { type: ['integer', 'null'] },
-          publico_e_estimativa: { type: 'boolean' },
           sentimento: { type: 'string', enum: ['positivo', 'negativo', 'neutro'] },
-          tem_versao_oficial: { type: 'boolean' },
-          tem_registro_publico: { type: 'boolean' },
-          lacunas: { type: 'string' },
-          midias: {
-            type: 'array',
-            items: {
-              type: 'object',
-              properties: {
-                url: { type: 'string' },
-                tipo: { type: 'string', enum: ['imagem', 'video', 'print_rede', 'audio'] },
-                credito: { type: 'string' },
-                legenda_original: { type: 'string' },
-                origem: { type: 'string' },
-              },
-              required: ['url', 'tipo', 'credito', 'legenda_original', 'origem'],
-              additionalProperties: false,
-            },
-          },
+          lacunas: { type: 'string', description: 'sempre mencione: coleta feita só por título/resumo de busca, sem ler a matéria inteira' },
         },
-        required: ['titulo_original','texto_bruto','url_fonte','veiculo','tipo_fonte','data_ocorrido','data_publicacao_fonte','evento','cidade','uf','ddd','camada_geo','local_evento','artistas','estilo_musical','tipo_evento','porte_produtor','produtora','ticketeira','nichos','porte_publico','publico_estimado','publico_e_estimativa','sentimento','tem_versao_oficial','tem_registro_publico','lacunas','midias'],
+        required: ['titulo_original','resumo_busca','url_fonte','veiculo','tipo_fonte','data_ocorrido','evento','cidade','uf','ddd','camada_geo','artistas','estilo_musical','tipo_evento','nichos','sentimento','lacunas'],
         additionalProperties: false,
       },
     },
@@ -120,7 +108,6 @@ const SCHEMA = {
 
 // ---------------------------------------------------------------- orçamento
 
-/** Redistribui as 100 pesquisas conforme a temperatura das camadas. */
 function orcamentoAjustado(temp) {
   const chaveCamada = { c1_marilia: 'c1_marilia', c2_014: 'c2_014', c3_018: 'c3_018', c4_sp: 'c4_sp', c5_brasil: 'c5_brasil' };
   const pesos = FRENTES.map((f) => {
@@ -134,7 +121,6 @@ function orcamentoAjustado(temp) {
     alocado += n;
     return { ...f, orcamento: n };
   });
-  // ajusta sobra/estouro na maior frente
   const delta = TETO - alocado;
   if (delta !== 0) {
     const maior = out.reduce((a, b) => (b.orcamento > a.orcamento ? b : a));
@@ -145,13 +131,13 @@ function orcamentoAjustado(temp) {
 
 // ---------------------------------------------------------------- coleta
 
-async function coletarFrente(frente, temp) {
+async function coletarFrente(frente, temp, horasJanela) {
   const enfase = Object.entries(temp)
     .filter(([, v]) => v !== 0)
     .map(([k, v]) => `${k}: ${v > 0 ? '+' : ''}${v}`)
     .join(' · ') || 'perfil neutro';
 
-  const prompt = `Colete acontecimentos das ÚLTIMAS 24 HORAS no mercado de eventos.
+  const prompt = `Busque acontecimentos das ÚLTIMAS ${horasJanela} HORAS no mercado de eventos (essa janela cobre o tempo desde a última rodada — pode ser mais que 24h porque o robô só roda 3x por semana).
 
 FRENTE: ${frente.alvo}
 
@@ -166,20 +152,19 @@ Busque em português, com e sem acento. Priorize a imprensa regional:
 018 — portalprudentino.com.br, grandeprudente.com.br, diariodeprudente.com, thmais.com.br, aracatuba.sp.gov.br
 Institucional — g1 regional, Procon-SP, Corpo de Bombeiros, Diário Oficial, Portal da Transparência municipal.
 
-Devolva SOMENTE acontecimentos datados das últimas 24h. Lista vazia é resposta válida e correta quando não houver nada.`;
+NÃO entre nas páginas. Use só o que aparece no resultado da busca (título + resumo). Devolva SOMENTE acontecimentos dentro da janela de tempo. Lista vazia é resposta válida.`;
 
   const stream = client.messages.stream({
     model: MODEL,
-    max_tokens: 32000,
+    max_tokens: 16000,
     thinking: { type: 'adaptive' },
     output_config: {
-      effort: 'high',
+      effort: 'medium',
       format: { type: 'json_schema', schema: SCHEMA },
     },
     system: SISTEMA,
     tools: [
       { type: 'web_search_20260209', name: 'web_search', max_uses: frente.orcamento },
-      { type: 'web_fetch_20260209', name: 'web_fetch', max_uses: Math.ceil(frente.orcamento / 2) },
     ],
     messages: [{ role: 'user', content: prompt }],
   });
@@ -205,7 +190,7 @@ Devolva SOMENTE acontecimentos datados das últimas 24h. Lista vazia é resposta
 // ---------------------------------------------------------------- gravação
 
 const hash = (n) =>
-  crypto.createHash('sha256').update((n.titulo_original || '') + (n.texto_bruto || '').slice(0, 500)).digest('hex');
+  crypto.createHash('sha256').update((n.titulo_original || '') + (n.resumo_busca || '').slice(0, 300)).digest('hex');
 
 async function gravar(n, camadaPadrao) {
   const h = hash(n);
@@ -213,7 +198,7 @@ async function gravar(n, camadaPadrao) {
   const dup = await db.query(
     `select 1 from noticias
       where url_fonte = $1
-         or (hash_conteudo = $2 and coletado_em >= now() - interval '72 hours')
+         or (hash_conteudo = $2 and coletado_em >= now() - interval '7 days')
       limit 1`,
     [n.url_fonte, h]
   );
@@ -221,51 +206,36 @@ async function gravar(n, camadaPadrao) {
 
   const data = (s) => (s && /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : null);
 
+  const lacunaCompleta = `${n.lacunas || ''} · coleta leve (Agente 2): sem leitura da matéria — porte, produtora, versão oficial e mídia não verificados`.trim();
+
   const { rows } = await db.query(
     `insert into noticias (
-       data_ocorrido, data_publicacao_fonte, titulo_original, texto_bruto, url_fonte,
-       veiculo, tipo_fonte, evento, cidade, uf, ddd, camada_geo, local_evento,
-       artistas, estilo_musical, tipo_evento, porte_produtor, produtora, ticketeira,
-       nichos, porte_publico, publico_estimado, publico_e_estimativa, sentimento,
-       tem_versao_oficial, tem_registro_publico, lacunas, hash_conteudo, status
+       data_ocorrido, titulo_original, texto_bruto, url_fonte,
+       veiculo, tipo_fonte, evento, cidade, uf, ddd, camada_geo,
+       artistas, estilo_musical, tipo_evento, nichos,
+       sentimento, lacunas, hash_conteudo, status
      ) values (
-       $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
-       $20,$21,$22,$23,$24,$25,$26,$27,$28,'bruto'
+       $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'bruto'
      )
      on conflict (url_fonte) do nothing
      returning id`,
     [
-      data(n.data_ocorrido),
-      n.data_publicacao_fonte || null,
-      n.titulo_original, n.texto_bruto, n.url_fonte, n.veiculo, n.tipo_fonte,
-      n.evento, n.cidade, n.uf, n.ddd,
-      n.camada_geo || camadaPadrao || 5,
-      n.local_evento,
-      n.artistas ?? [], n.estilo_musical ?? [], n.tipo_evento, n.porte_produtor,
-      n.produtora, n.ticketeira, n.nichos ?? [], n.porte_publico,
-      n.publico_estimado, n.publico_e_estimativa ?? false, n.sentimento,
-      n.tem_versao_oficial ?? false, n.tem_registro_publico ?? false,
-      n.lacunas ?? '', h,
+      data(n.data_ocorrido), n.titulo_original, n.resumo_busca, n.url_fonte, n.veiculo, n.tipo_fonte,
+      n.evento, n.cidade, n.uf, n.ddd, n.camada_geo || camadaPadrao || 5,
+      n.artistas ?? [], n.estilo_musical ?? [], n.tipo_evento, n.nichos ?? [],
+      n.sentimento, lacunaCompleta, h,
     ]
   );
-  if (!rows.length) return 'duplicata';
-
-  for (const m of n.midias ?? []) {
-    await db.query(
-      `insert into midias (noticia_id, url, tipo, credito, legenda_original, origem)
-       values ($1,$2,$3,$4,$5,$6)`,
-      [rows[0].id, m.url, m.tipo, m.credito || 'nao_identificado', m.legenda_original || '', m.origem || '']
-    );
-  }
-  return 'gravada';
+  return rows.length ? 'gravada' : 'duplicata';
 }
 
 // ---------------------------------------------------------------- main
 
 async function main() {
-  console.log(`[${agora()}] radar-eventos iniciando`);
+  console.log(`[${agora()}] radar-eventos (v2, so link) iniciando`);
 
   const { mapa: temp } = await lerTemperaturas();
+  const horasJanela = await janelaDinamica();
   const frentes = orcamentoAjustado(temp);
 
   const { rows: [log] } = await db.query(
@@ -273,7 +243,7 @@ async function main() {
     [JSON.stringify(temp)]
   );
 
-  let gastas = 0, gravadas = 0, duplicatas = 0, midias = 0;
+  let gastas = 0, gravadas = 0, duplicatas = 0;
   const erros = [], naoVarridas = [];
 
   for (const frente of frentes) {
@@ -283,13 +253,13 @@ async function main() {
     const f = { ...frente, orcamento: Math.min(frente.orcamento, restante) };
 
     try {
-      const r = await coletarFrente(f, temp);
+      const r = await coletarFrente(f, temp, horasJanela);
       gastas += r.gastas;
       if (r.erro) erros.push(r.erro);
 
       for (const n of r.noticias) {
         const st = await gravar(n, f.camada);
-        if (st === 'gravada') { gravadas++; midias += (n.midias ?? []).length; }
+        if (st === 'gravada') gravadas++;
         else duplicatas++;
       }
       console.log(`  ${f.id}: ${r.noticias.length} itens · ${r.gastas} pesquisas`);
@@ -313,11 +283,11 @@ async function main() {
   );
 
   await telegram(
-    `<b>RADAR-EVENTOS</b> — ${agora()}\n\n` +
+    `<b>RADAR-EVENTOS</b> (v2, só link) — ${agora()}\n` +
+    `Janela coberta: últimas <b>${horasJanela}h</b> (dinâmica, cobre desde a última rodada)\n\n` +
     `Pesquisas: <b>${gastas}/${TETO}</b>\n` +
     `Notícias gravadas: <b>${gravadas}</b>\n` +
-    `Duplicatas descartadas: ${duplicatas}\n` +
-    `Mídias registradas: ${midias}\n\n` +
+    `Duplicatas descartadas: ${duplicatas}\n\n` +
     `Por camada: ${resumo.rows.map((r) => `C${r.camada_geo}: ${r.n}`).join(' | ') || '—'}\n` +
     (naoVarridas.length ? `\nFrentes não varridas: ${naoVarridas.join(', ')}\n` : '') +
     (erros.length ? `\n⚠ Erros:\n${erros.map((e) => '  ' + e).join('\n')}\n` : '') +
