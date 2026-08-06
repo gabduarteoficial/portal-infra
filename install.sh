@@ -146,8 +146,10 @@ log "     subindo a stack (pode levar alguns minutos na primeira vez)"
 ( cd "$SUPA_DIR" && docker compose pull -q && docker compose up -d )
 
 log "     aguardando o Postgres aceitar conexão"
+# Porta 5432 é o pooler (supavisor), não o Postgres nu — exige usuário no
+# formato "postgres.<tenant>" (tenant = POOLER_TENANT_ID acima).
 for i in $(seq 1 60); do
-  if PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -qc 'select 1' >/dev/null 2>&1; then
+  if PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -p 5432 -U postgres.portal -d postgres -qc 'select 1' >/dev/null 2>&1; then
     ok "postgres respondendo"; break
   fi
   [[ $i -eq 60 ]] && { echo "Postgres não subiu. Veja: cd $SUPA_DIR && docker compose logs db"; exit 1; }
@@ -192,7 +194,7 @@ log "7/11  Arquivo .env da aplicação"
 if [[ ! -f "$APP_DIR/.env" ]]; then
   cat > "$APP_DIR/.env" <<ENV
 # ---- banco (Supabase self-hosted, localhost) ----
-DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@127.0.0.1:5432/${DB_NAME}
+DATABASE_URL=postgresql://postgres.portal:${POSTGRES_PASSWORD}@127.0.0.1:5432/${DB_NAME}
 
 # ---- Telegram (PREENCHER) ----
 # Token: fale com @BotFather   |   Seu ID: fale com @userinfobot
@@ -210,7 +212,7 @@ TZ=${TZ_ALVO}
 ENV
   ok ".env criado"
 else
-  sed -i "s|^DATABASE_URL=.*|DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@127.0.0.1:5432/${DB_NAME}|" "$APP_DIR/.env"
+  sed -i "s|^DATABASE_URL=.*|DATABASE_URL=postgresql://postgres.portal:${POSTGRES_PASSWORD}@127.0.0.1:5432/${DB_NAME}|" "$APP_DIR/.env"
   ok ".env preservado (DATABASE_URL sincronizado)"
 fi
 chown "$APP_USER:$APP_USER" "$APP_DIR/.env"
@@ -218,9 +220,9 @@ chmod 600 "$APP_DIR/.env"
 
 # ---------------------------------------------------------------------
 log "8/11  Schema do banco"
-PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U postgres -d "$DB_NAME" \
+PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U postgres.portal -d "$DB_NAME" \
   -q -v ON_ERROR_STOP=1 -f "$APP_DIR/schema.sql"
-TABELAS=$(PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U postgres -d "$DB_NAME" -tAc \
+TABELAS=$(PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U postgres.portal -d "$DB_NAME" -tAc \
   "select count(*) from information_schema.tables where table_schema='public' and table_type='BASE TABLE';")
 ok "$TABELAS tabelas no schema public"
 
